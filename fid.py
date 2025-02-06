@@ -21,20 +21,15 @@ from training import dataset
 #----------------------------------------------------------------------------
 
 def calculate_inception_stats(
-    image_path, num_expected=None, seed=0, max_batch_size=64,
-    num_workers=3, prefetch_factor=2, device=torch.device('cuda'),
+    image_path, num_expected=None, seed=0, max_batch_size=64, device=torch.device('cuda'),
 ):
-    # Rank 0 goes first.
-    if dist.get_rank() != 0:
-        torch.distributed.barrier()
-
     # Load Inception-v3 model.
     # This is a direct PyTorch translation of http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz
     dist.print0('Loading Inception-v3 model...')
     detector_url = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/inception-2015-12-05.pkl'
     detector_kwargs = dict(return_features=True)
     feature_dim = 2048
-    with dnnlib.util.open_url(detector_url, verbose=(dist.get_rank() == 0)) as f:
+    with dnnlib.util.open_url(detector_url) as f:
         detector_net = pickle.load(f).to(device)
 
     # List images.
@@ -45,22 +40,14 @@ def calculate_inception_stats(
     if len(dataset_obj) < 2:
         raise click.ClickException(f'Found {len(dataset_obj)} images, but need at least 2 to compute statistics')
 
-    # Other ranks follow.
-    if dist.get_rank() == 0:
-        torch.distributed.barrier()
-
     # Divide images into batches.
-    num_batches = ((len(dataset_obj) - 1) // (max_batch_size * dist.get_world_size()) + 1) * dist.get_world_size()
-    all_batches = torch.arange(len(dataset_obj)).tensor_split(num_batches)
-    rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
-    data_loader = torch.utils.data.DataLoader(dataset_obj, batch_sampler=rank_batches, num_workers=num_workers, prefetch_factor=prefetch_factor)
+    data_loader = torch.utils.data.DataLoader(dataset_obj)
 
     # Accumulate statistics.
     dist.print0(f'Calculating statistics for {len(dataset_obj)} images...')
     mu = torch.zeros([feature_dim], dtype=torch.float64, device=device)
     sigma = torch.zeros([feature_dim, feature_dim], dtype=torch.float64, device=device)
-    for images, _labels in tqdm.tqdm(data_loader, unit='batch', disable=(dist.get_rank() != 0)):
-        torch.distributed.barrier()
+    for images, _labels in tqdm.tqdm(data_loader, unit='batch'):
         if images.shape[0] == 0:
             continue
         if images.shape[1] == 1:
@@ -68,10 +55,9 @@ def calculate_inception_stats(
         features = detector_net(images.to(device), **detector_kwargs).to(torch.float64)
         mu += features.sum(0)
         sigma += features.T @ features
-
+        
+        
     # Calculate grand totals.
-    torch.distributed.all_reduce(mu)
-    torch.distributed.all_reduce(sigma)
     mu /= len(dataset_obj)
     sigma -= mu.ger(mu) * len(dataset_obj)
     sigma /= len(dataset_obj) - 1

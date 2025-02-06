@@ -16,7 +16,7 @@ import torch
 import dnnlib
 from torch_utils import distributed as dist
 from training import training_loop
-
+import lpips
 import warnings
 warnings.filterwarnings('ignore', 'Grad strides do not match bucket view strides') # False warning printed by PyTorch 1.12.
 
@@ -42,10 +42,15 @@ def parse_int_list(s):
 
 # Main options.
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
-@click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
+@click.option('--data1train',    help='Path to the dataset1', metavar='ZIP|DIR',                    type=str, required=True)
+@click.option('--data2train',    help='Path to the dataset2', metavar='ZIP|DIR',                    type=str, required=True)
+@click.option('--data1test',     help='Path to the dataset1', metavar='ZIP|DIR',                    type=str, required=True)
+@click.option('--data2test',     help='Path to the dataset2', metavar='ZIP|DIR',                    type=str, required=True)
+@click.option('--data1stats',    help='Path to the dataset1', metavar='ZIP|DIR',                    type=str, required=True)
+@click.option('--data2stats',    help='Path to the dataset2', metavar='ZIP|DIR',                    type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
-@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm',       type=click.Choice(['vp', 've', 'edm']), default='edm', show_default=True)
+@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm',       type=click.Choice(['no', 'vp', 've', 'edm']), default='edm', show_default=True)
 
 # Hyperparameters.
 @click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
@@ -53,7 +58,7 @@ def parse_int_list(s):
 @click.option('--batch-gpu',     help='Limit batch size per GPU', metavar='INT',                    type=click.IntRange(min=1))
 @click.option('--cbase',         help='Channel multiplier  [default: varies]', metavar='INT',       type=int)
 @click.option('--cres',          help='Channels per resolution  [default: varies]', metavar='LIST', type=parse_int_list)
-@click.option('--lr',            help='Learning rate', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=10e-4, show_default=True)
+@click.option('--lr',            help='Learning rate', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=1e-4, show_default=True)
 @click.option('--ema',           help='EMA half-life', metavar='MIMG',                              type=click.FloatRange(min=0), default=0.5, show_default=True)
 @click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.13, show_default=True)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
@@ -87,64 +92,113 @@ def main(**kwargs):
     # Train DDPM++ model for class-conditional CIFAR-10 using 8 GPUs
     torchrun --standalone --nproc_per_node=8 train.py --outdir=training-runs \\
         --data=datasets/cifar10-32x32.zip --cond=1 --arch=ddpmpp
-    """
+    """    
     opts = dnnlib.EasyDict(kwargs)
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
 
     # Initialize config dict.
     c = dnnlib.EasyDict()
-    c.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
-    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
-    c.network_kwargs = dnnlib.EasyDict()
-    c.loss_kwargs = dnnlib.EasyDict()
-    c.optimizer_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.lr, betas=[0.9,0.999], eps=1e-8)
+    c.dataset1train_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data1train, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
+    c.dataset2train_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data2train, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
+    c.dataset1test_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data1test, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
+    c.dataset2test_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data2test, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
+    c.data_loader1train_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
+    c.data_loader2train_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
+    c.data_loader1test_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
+    c.data_loader2test_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
 
-    # Validate dataset options.
+    c.dataset1stats_path=opts.data1stats
+    c.dataset2stats_path=opts.data2stats
+
+    c.network1_kwargs = dnnlib.EasyDict()
+    c.loss1_kwargs = dnnlib.EasyDict()
+    c.optimizer1_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.lr, betas=[0.9,0.999], eps=1e-8)
+    
+    c.network2_kwargs = dnnlib.EasyDict()
+    c.loss2_kwargs = dnnlib.EasyDict()
+    c.optimizer2_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.lr, betas=[0.9,0.999], eps=1e-8)
+
+    # Validate datasets options.
     try:
-        dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset_kwargs)
-        dataset_name = dataset_obj.name
-        c.dataset_kwargs.resolution = dataset_obj.resolution # be explicit about dataset resolution
-        c.dataset_kwargs.max_size = len(dataset_obj) # be explicit about dataset size
+        dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset1train_kwargs)
+        dataset1train_name = dataset_obj.name
+        c.dataset1train_kwargs.resolution = dataset_obj.resolution # be explicit about dataset resolution
+        c.dataset1train_kwargs.max_size = len(dataset_obj) # be explicit about dataset size
+        if opts.cond and not dataset_obj.has_labels:
+            raise click.ClickException('--cond=True requires labels specified in dataset.json')
+        del dataset_obj # conserve memory
+    except IOError as err:
+        raise click.ClickException(f'--data: {err}')
+    
+    try:
+        dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset2train_kwargs)
+        dataset2train_name = dataset_obj.name
+        c.dataset2train_kwargs.resolution = dataset_obj.resolution # be explicit about dataset resolution
+        c.dataset2train_kwargs.max_size = len(dataset_obj) # be explicit about dataset size
+        if opts.cond and not dataset_obj.has_labels:
+            raise click.ClickException('--cond=True requires labels specified in dataset.json')
+        del dataset_obj # conserve memory
+    except IOError as err:
+        raise click.ClickException(f'--data: {err}')
+    
+    try:
+        dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset1test_kwargs)
+        dataset1test_name = dataset_obj.name
+        c.dataset1test_kwargs.resolution = dataset_obj.resolution # be explicit about dataset resolution
+        c.dataset1test_kwargs.max_size = len(dataset_obj) # be explicit about dataset size
+        if opts.cond and not dataset_obj.has_labels:
+            raise click.ClickException('--cond=True requires labels specified in dataset.json')
+        del dataset_obj # conserve memory
+    except IOError as err:
+        raise click.ClickException(f'--data: {err}')
+    
+    try:
+        dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset2test_kwargs)
+        dataset2test_name = dataset_obj.name
+        c.dataset2test_kwargs.resolution = dataset_obj.resolution # be explicit about dataset resolution
+        c.dataset2test_kwargs.max_size = len(dataset_obj) # be explicit about dataset size
         if opts.cond and not dataset_obj.has_labels:
             raise click.ClickException('--cond=True requires labels specified in dataset.json')
         del dataset_obj # conserve memory
     except IOError as err:
         raise click.ClickException(f'--data: {err}')
 
+
     # Network architecture.
     if opts.arch == 'ddpmpp':
-        c.network_kwargs.update(model_type='SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[2,2,2])
-    elif opts.arch == 'ncsnpp':
-        c.network_kwargs.update(model_type='SongUNet', embedding_type='fourier', encoder_type='residual', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[2,2,2])
+        c.network1_kwargs.update(model_type='SongUNet', encoder_type='standard', decoder_type='standard')
+        c.network1_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[2,2,2])
+
+        c.network2_kwargs.update(model_type='SongUNetD', encoder_type='standard', decoder_type='standard')
+        c.network2_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[2,2,2])
     else:
         assert opts.arch == 'adm'
-        c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])
+        c.network1_kwargs.update(model_type='SongUNet', encoder_type='residual', decoder_type='standard')
+        c.network1_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[2,2,2])
+
+        c.network2_kwargs.update(model_type='SongUNetD', encoder_type='residual', decoder_type='standard')
+        c.network2_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[2,2,2])
+
 
     # Preconditioning & loss function.
-    if opts.precond == 'vp':
-        c.network_kwargs.class_name = 'training.networks.VPPrecond'
-        c.loss_kwargs.class_name = 'training.loss.VPLoss'
-    elif opts.precond == 've':
-        c.network_kwargs.class_name = 'training.networks.VEPrecond'
-        c.loss_kwargs.class_name = 'training.loss.VELoss'
-    else:
-        assert opts.precond == 'edm'
-        c.network_kwargs.class_name = 'training.networks.EDMPrecond'
-        c.loss_kwargs.class_name = 'training.loss.EDMLoss'
+    assert opts.precond == 'no'
+    if opts.precond == 'no':
+        c.network1_kwargs.class_name = 'src.SongUnet.NOPrecond'
+        c.network2_kwargs.class_name = 'src.SongUnet.NOPrecond'
+        # c.loss_kwargs.class_name = 'training.loss.VPLoss'
 
     # Network options.
-    if opts.cbase is not None:
-        c.network_kwargs.model_channels = opts.cbase
-    if opts.cres is not None:
-        c.network_kwargs.channel_mult = opts.cres
-    if opts.augment:
-        c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', p=opts.augment)
-        c.augment_kwargs.update(xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1)
-        c.network_kwargs.augment_dim = 9
-    c.network_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16)
+    # if opts.cbase is not None:
+    #     c.network_kwargs.model_channels = opts.cbase
+    # if opts.cres is not None:
+    #     c.network_kwargs.channel_mult = opts.cres
+    # if opts.augment:
+    #     c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', p=opts.augment)
+    #     c.augment_kwargs.update(xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1)
+    #     c.network_kwargs.augment_dim = 9
+    c.network1_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16)
+    c.network2_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16)
 
     # Training options.
     c.total_kimg = max(int(opts.duration * 1000), 1)
@@ -161,24 +215,13 @@ def main(**kwargs):
         torch.distributed.broadcast(seed, src=0)
         c.seed = int(seed)
 
-    # Transfer learning and resume.
-    if opts.transfer is not None:
-        if opts.resume is not None:
-            raise click.ClickException('--transfer and --resume cannot be specified at the same time')
-        c.resume_pkl = opts.transfer
-        c.ema_rampup_ratio = None
-    elif opts.resume is not None:
-        match = re.fullmatch(r'training-state-(\d+).pt', os.path.basename(opts.resume))
-        if not match or not os.path.isfile(opts.resume):
-            raise click.ClickException('--resume must point to training-state-*.pt from a previous training run')
-        c.resume_pkl = os.path.join(os.path.dirname(opts.resume), f'network-snapshot-{match.group(1)}.pkl')
-        c.resume_kimg = int(match.group(1))
+    if opts.resume is not None:
         c.resume_state_dump = opts.resume
 
     # Description string.
-    cond_str = 'cond' if c.dataset_kwargs.use_labels else 'uncond'
-    dtype_str = 'fp16' if c.network_kwargs.use_fp16 else 'fp32'
-    desc = f'{dataset_name:s}-{cond_str:s}-{opts.arch:s}-{opts.precond:s}-gpus{dist.get_world_size():d}-batch{c.batch_size:d}-{dtype_str:s}'
+    cond_str = 'cond' if c.dataset1train_kwargs.use_labels else 'uncond'
+    dtype_str = 'fp16' if c.network1_kwargs.use_fp16 else 'fp32'
+    desc = f'{dataset1train_name:s}-{dataset2train_name:s}-{cond_str:s}-{opts.arch:s}-{opts.precond:s}-gpus{dist.get_world_size():d}-batch{c.batch_size:d}-{dtype_str:s}'
     if opts.desc is not None:
         desc += f'-{opts.desc}'
 
@@ -203,13 +246,14 @@ def main(**kwargs):
     dist.print0(json.dumps(c, indent=2))
     dist.print0()
     dist.print0(f'Output directory:        {c.run_dir}')
-    dist.print0(f'Dataset path:            {c.dataset_kwargs.path}')
-    dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
+    dist.print0(f'Dataset1 path:           {c.dataset1train_kwargs.path}')
+    dist.print0(f'Dataset2 path:           {c.dataset2train_kwargs.path}')
+    dist.print0(f'Class-conditional:       {c.dataset1train_kwargs.use_labels}')
     dist.print0(f'Network architecture:    {opts.arch}')
     dist.print0(f'Preconditioning & loss:  {opts.precond}')
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
     dist.print0(f'Batch size:              {c.batch_size}')
-    dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
+    dist.print0(f'Mixed-precision:         {c.network1_kwargs.use_fp16}')
     dist.print0()
 
     # Dry run?
@@ -234,3 +278,5 @@ if __name__ == "__main__":
     main()
 
 #----------------------------------------------------------------------------
+
+# torchrun --standalone --nproc_per_node=4 train.py --outdir=outdir --data1train=datasets/male64train.zip --data2train=datasets/female64train.zip --data1test=datasets/male64test.zip --data2test=datasets/female64test.zip --data1stats=datasets/male64train.npz --data2stats=datasets/female64train.npz --batch=256 --precond=no --batch-gpu=32 --resume=/home/iasudakov/project/edm/outdir/00030-male64train-female64train-uncond-ddpmpp-no-gpus2-batch256-fp32/training-state-2000.pt 
