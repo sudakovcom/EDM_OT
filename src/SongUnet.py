@@ -448,6 +448,16 @@ class NOPrecond(torch.nn.Module):
         self.img_channels = img_channels
         self.model = globals()[model_type](img_resolution=img_resolution, in_channels=img_channels, out_channels=img_channels, **model_kwargs)
 
+        param_size = 0
+        for param in self.model.parameters():
+            param_size += param.nelement() * param.element_size()
+        buffer_size = 0
+        for buffer in self.model.buffers():
+            buffer_size += buffer.nelement() * buffer.element_size()
+
+        size_all_mb = (param_size + buffer_size) / 1024**2
+        print('model size: {:.3f}MB'.format(size_all_mb))
+
     def forward(self, x, z=None):
         if z is not None:
             return self.model(x, z)

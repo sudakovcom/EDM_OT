@@ -56,6 +56,8 @@ def parse_int_list(s):
 @click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
 @click.option('--batch',         help='Total batch size', metavar='INT',                            type=click.IntRange(min=1), default=512, show_default=True)
 @click.option('--batch-gpu',     help='Limit batch size per GPU', metavar='INT',                    type=click.IntRange(min=1))
+@click.option('--t_iters',       help='T iters', metavar='INT',                                     type=click.IntRange(min=1), default=10, show_default=True)
+@click.option('--f_iters',       help='f iters', metavar='INT',                                     type=click.IntRange(min=1), default=1, show_default=True)
 @click.option('--cbase',         help='Channel multiplier  [default: varies]', metavar='INT',       type=int)
 @click.option('--cres',          help='Channels per resolution  [default: varies]', metavar='LIST', type=parse_int_list)
 @click.option('--lr',            help='Learning rate', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=1e-4, show_default=True)
@@ -99,6 +101,11 @@ def main(**kwargs):
 
     # Initialize config dict.
     c = dnnlib.EasyDict()
+    
+    c.t_iters = opts.t_iters
+    c.f_iters = opts.f_iters
+    
+    
     c.dataset1train_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data1train, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
     c.dataset2train_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data2train, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
     c.dataset1test_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data1test, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
@@ -171,7 +178,7 @@ def main(**kwargs):
         c.network1_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[2,2,2])
 
         c.network2_kwargs.update(model_type='SongUNetD', encoder_type='standard', decoder_type='standard')
-        c.network2_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[2,2,2])
+        c.network2_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=192, channel_mult=[2,2,2])
     else:
         assert opts.arch == 'adm'
         c.network1_kwargs.update(model_type='SongUNet', encoder_type='residual', decoder_type='standard')

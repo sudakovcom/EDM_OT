@@ -71,6 +71,7 @@ def training_loop(
     batch_gpu           = None,     # Limit batch size per GPU, None = no limit.
     total_kimg          = 200000,   # Training duration, measured in thousands of training images.
     t_iters             = 10,
+    f_iters             = 1,
     nz                  = 100,
     ema_halflife_kimg   = 500,      # Half-life of the exponential moving average (EMA) of model weights.
     ema_rampup_ratio    = 0.05,     # EMA ramp-up coefficient, None = no rampup.
@@ -158,7 +159,7 @@ def training_loop(
 
     if dist.get_rank() == 0:
         # wandb.init(name='tester', project='EDM-NOT', id="g7icxun0", resume="must")
-        wandb.init(name='4gpu', project='EDM-NOT')
+        wandb.init(name=f'4gpu_strongD_D_{f_iters}it_G_{t_iters}it', project='EDM-NOT')
 
     # Train.
     dist.print0(f'Training for {total_kimg} kimg...')
@@ -208,27 +209,28 @@ def training_loop(
         # Accumulate gradients.
         unfreeze(ddp2)
         freeze(ddp1)
-        for round_idx in range(num_accumulation_rounds):
-            with misc.ddp_sync(ddp2, (round_idx == num_accumulation_rounds - 1)):
-                images, _ = next(dataset1train_iterator)
-                X = images.to(device).to(torch.float32) / 127.5 - 1
-                with torch.no_grad():
-                    latent_z = torch.randn(X.shape[0], nz, device=X.device)*0.1
-                    T_X = ddp1(X, latent_z)
-                images, _ = next(dataset2train_iterator)
-                Y = images.to(device).to(torch.float32) / 127.5 - 1
-                loss = ddp2(T_X).mean() - ddp2(Y).mean()
-                training_stats.report('Loss/loss', loss)
-                loss.sum().mul(loss_scaling / batch_gpu_total).backward()
+        for f_iter in range(f_iters):
+            for round_idx in range(num_accumulation_rounds):
+                with misc.ddp_sync(ddp2, (round_idx == num_accumulation_rounds - 1)):
+                    images, _ = next(dataset1train_iterator)
+                    X = images.to(device).to(torch.float32) / 127.5 - 1
+                    with torch.no_grad():
+                        latent_z = torch.randn(X.shape[0], nz, device=X.device)*0.1
+                        T_X = ddp1(X, latent_z)
+                    images, _ = next(dataset2train_iterator)
+                    Y = images.to(device).to(torch.float32) / 127.5 - 1
+                    loss = ddp2(T_X).mean() - ddp2(Y).mean()
+                    training_stats.report('Loss/loss', loss)
+                    loss.sum().mul(loss_scaling / batch_gpu_total).backward()
 
-        # Update weights.
-        for g in optimizer2.param_groups:
-            g['lr'] = optimizer2_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
-        for param in net2.parameters():
-            if param.grad is not None:
-                torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
-        optimizer2.step()
-        optimizer2.zero_grad(set_to_none=True)
+            # Update weights.
+            for g in optimizer2.param_groups:
+                g['lr'] = optimizer2_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
+            for param in net2.parameters():
+                if param.grad is not None:
+                    torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
+            optimizer2.step()
+            optimizer2.zero_grad(set_to_none=True)
         
         if dist.get_rank() == 0:
             wandb.log({f'f_loss' : loss.item()}, step=step)
@@ -265,9 +267,9 @@ def training_loop(
                 
         step+=1
         
-        if dist.get_rank() == 0:
-            if step % 1000 == 0:
-                torch.save(dict(net1=net1, net2=net2, ema1=ema1, ema2=ema2, optimizer1_state=optimizer1.state_dict(), optimizer2_state=optimizer2.state_dict()), os.path.join(run_dir, f'training-state-{step}.pt'))
+        # if dist.get_rank() == 0:
+        #     if step % 1000 == 0:
+        #         torch.save(dict(net1=net1, net2=net2, ema1=ema1, ema2=ema2, optimizer1_state=optimizer1.state_dict(), optimizer2_state=optimizer2.state_dict()), os.path.join(run_dir, f'training-state-{step}.pt'))
 
             
         if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
